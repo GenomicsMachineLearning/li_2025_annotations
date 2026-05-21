@@ -5,14 +5,23 @@ import numpy
 import svgelements
 import shapely
 from pathlib import Path
+import matplotlib.pyplot as plt
 from PIL import Image
 import pandas
-from pandas import DataFrame
 
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data" / "samples" / "Li_2025"
 SPACERANGER_DIR = DATA_ROOT / "spaceranger_output"
 SVG_DIR = DATA_ROOT / "Images" / "Manual_annotation"
 OUT_DIR = Path(__file__).resolve().parents[2] / "outputs"
+
+CATEGORIES = ["tumor", "immune", "DCIS", "blood_vessel", "necrosis"]
+PALETTE = {
+    "tumor": "#e41a1c",
+    "immune": "#377eb8",
+    "DCIS": "#4daf4a",
+    "blood_vessel": "#984ea3",
+    "necrosis": "#000000",
+}
 
 # sample_id -> annotation SVG filename
 SAMPLES: dict[str, str] = {
@@ -149,10 +158,6 @@ def assign_annotations(visium_file, annotations, matrix_transform,
     scalef_x = lowres_scalef * (content_w / lowres_w)
     scalef_y = lowres_scalef * (content_h / lowres_h)
 
-    print(f"Embedded content: x {cx0}..{cx1} ({content_w}px), y {cy0}..{cy1} ({content_h}px)")
-    print(f"Lowres: {lowres_w} × {lowres_h}")
-    print(f"Anno scalef: x={scalef_x:.6f}, y={scalef_y:.6f}")
-
     # 4. Spot coords: fullres -> content-pixels -> embedded-pixels -> SVG space
     spots_full = numpy.asarray(visium_file.obsm['spatial'])
     spots_in_content = spots_full * numpy.array([scalef_x, scalef_y])
@@ -162,9 +167,6 @@ def assign_annotations(visium_file, annotations, matrix_transform,
                   [matrix_transform.b, matrix_transform.d, matrix_transform.f]])
     ones = numpy.ones((spots_in_embedded.shape[0], 1))
     spots_svg = numpy.hstack([spots_in_embedded, ones]) @ M.T
-
-    print(f"Spots SVG range: x {spots_svg[:,0].min():.0f}..{spots_svg[:,0].max():.0f}, "
-          f"y {spots_svg[:,1].min():.0f}..{spots_svg[:,1].max():.0f}")
 
     # 5. Build spatial index + assign
     labels = [lbl for lbl, _ in annotations]
@@ -196,12 +198,31 @@ def process_sample(sample_id: str, spaceranger_outs: Path, svg_path: Path) -> pa
     print(f"Processing sample {sample_id} {spaceranger_outs} {svg_path}")
     return adata
 
-def write_out_csv(sample_id: str, adata: DataFrame, index_name="Barcode",
+def write_out_csv(sample_id: str, adata, index_name="Barcode",
                   annotation_column="Morphological Annotation"):
     out = adata.obs[["annotation"]].copy()
     out.index.name = index_name
     out = out.rename(columns={"annotation": annotation_column})
     out.to_csv(OUT_DIR / f"{sample_id}.csv", index=True, na_rep="")
+
+def plot_result(sample_id: str, adata):
+    ann = adata.obs["annotation"].astype(str)
+    ann = ann.where(ann.isin(CATEGORIES), other=numpy.nan)
+    adata.obs["annotation"] = pandas.Categorical(ann, categories=CATEGORIES)
+    adata.uns["annotation_colors"] = [PALETTE[c] for c in CATEGORIES]
+    adata = adata[adata.obs["annotation"].notna()].copy()
+
+    scanpy.pl.spatial(
+        adata,
+        color="annotation",
+        spot_size=100,
+        alpha=0.9,
+        legend_loc="right margin",
+        na_in_legend=False,
+        show=False,
+    )
+    plt.savefig(OUT_DIR / f"{sample_id}.png", dpi=100, bbox_inches="tight")
+    plt.close()
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -215,15 +236,15 @@ def main() -> int:
         if not svg.is_file():
             missing.append(f"  missing svg: {svg}")
             continue
-        print(f"  {sample_id} <- {svg.name}")
         adata = process_sample(sample_id, outs, svg)
         write_out_csv(sample_id, adata)
+        plot_result(sample_id, adata)
 
     if missing:
         print("\nIssues:")
         print("\n".join(missing))
         return 1
-    print(f"\nProcessed {len(SAMPLES)} samples → {OUT_DIR}")
+    print(f"\nProcessed {len(SAMPLES)} samples to directory {OUT_DIR}")
     return 0
 
 if __name__ == "__main__":
