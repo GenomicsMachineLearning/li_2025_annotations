@@ -19,12 +19,13 @@ dependencies = [
     "spatialdata-io>=0.6.0",
     "pandas>=2.3.0",
     "numpy>=2.0",
+    "shapely>=2.0",
     "svgelements>=1.9.0",
 ]
 
 [project.scripts]
 download = "li_2025_annotations.download:main"
-# process = "li_2025_annotations.process:main"
+process = "li_2025_annotations.process:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
