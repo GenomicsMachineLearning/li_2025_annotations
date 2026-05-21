@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "li_2025_annotations"
+version = "0.1.0"
+description = "Download and process Li 2025 breast cancer spatial transcriptomics data."
+authors = [{name = "Andrew Newman", email = "andrewfnewman@gmail.com"}]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "tqdm>=4.66",
+    "anndata>=0.12.0",
+    "scanpy>=1.12.0",
+    "squidpy>=1.8.0",
+    "spatialdata>=0.7.0",
+    "spatialdata-io>=0.6.0",
+    "pandas>=2.3.0",
+    "numpy>=2.0",
+    "svgelements>=1.9.0",
+]
+
+[project.scripts]
+download = "li_2025_annotations.download:main"
+# process = "li_2025_annotations.process:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
