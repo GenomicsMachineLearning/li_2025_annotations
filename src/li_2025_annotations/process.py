@@ -1,13 +1,22 @@
 """Process spaceranger outputs + SVG annotations → per-sample CSVs."""
 import base64, io, re
+from typing import Any
+
 import scanpy
+import squidpy
 import numpy
 import svgelements
 import shapely
 from pathlib import Path
-import matplotlib.pyplot as plt
 from PIL import Image
 import pandas
+
+# Silence var_names_make_unique warning
+import warnings
+
+from numpy import dtype, ndarray
+
+warnings.filterwarnings("ignore", message="Variable names are not unique")
 
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data" / "samples" / "Li_2025"
 SPACERANGER_DIR = DATA_ROOT / "spaceranger_output"
@@ -17,9 +26,9 @@ OUT_DIR = Path(__file__).resolve().parents[2] / "outputs"
 CATEGORIES = ["tumor", "immune", "DCIS", "blood_vessel", "necrosis"]
 PALETTE = {
     "tumor": "#e41a1c",
-    "immune": "#377eb8",
-    "DCIS": "#4daf4a",
-    "blood_vessel": "#984ea3",
+    "immune": "#ffc803",
+    "DCIS": "#20009d",
+    "blood_vessel": "#3ecbea",
     "necrosis": "#000000",
 }
 
@@ -70,10 +79,12 @@ COLOR_TO_CLASS = {
     "#00ffff": "blood_vessel",
 }
 
+
 def load_visium_raw(filename, library_id="sample"):
-    adata = scanpy.read_visium(path=filename, library_id=library_id)
+    adata = squidpy.read.visium(path=filename, library_id=library_id)
     adata.var_names_make_unique()
     return adata
+
 
 def normalize_hex(c):
     """#f00 -> #ff0000, handles svgelements Color objects."""
@@ -82,9 +93,11 @@ def normalize_hex(c):
     s = str(svgelements.Color(c)).lower()
     return s
 
+
 def img_to_svg(mt, x_img, y_img):
     return (mt.a * x_img + mt.c * y_img + mt.e,
             mt.b * x_img + mt.d * y_img + mt.f)
+
 
 def path_to_polygons(element):
     """Robust path -> polygon list."""
@@ -111,6 +124,7 @@ def path_to_polygons(element):
             polys.append(poly)
     return polys
 
+
 def parse_svg(svg_file):
     svg = svgelements.SVG.parse(svg_file)
     annotations = []
@@ -132,9 +146,8 @@ def parse_svg(svg_file):
                 annotations.append((label, poly))
     return annotations, matrix_transform, element_height, element_width
 
-def assign_annotations(visium_file, annotations, matrix_transform,
-                       svg_file, priority=None, default="none"):
-    # 1. Extract embedded PNG to find tissue content bounds
+
+def _content_bounds(svg_file):
     with open(svg_file) as f:
         svg_text = f.read()
     m = re.search(r'data:image/png;base64,([A-Za-z0-9+/=]+)', svg_text)
@@ -146,57 +159,96 @@ def assign_annotations(visium_file, annotations, matrix_transform,
     cy0, cy1 = numpy.where(row_std > 5)[0][[0, -1]]
     content_w = cx1 - cx0 + 1
     content_h = cy1 - cy0 + 1
+    return content_h, content_w, cx0, cy0
 
-    # 2. Lowres image dimensions and scale factor
+
+def _get_spatial_metadata(visium_file):
     lib = list(visium_file.uns['spatial'].keys())[0]
-    lowres_scalef = visium_file.uns['spatial'][lib]['scalefactors']['tissue_lowres_scalef']
+    lowres_scalef = visium_file.uns['spatial'][lib]['scalefactors'][
+        'tissue_lowres_scalef']
     lowres_img = visium_file.uns['spatial'][lib]['images']['lowres']
-    spot_diameter_fullres = visium_file.uns['spatial'][lib]['scalefactors']['spot_diameter_fullres']
+    spot_diameter_fullres = visium_file.uns['spatial'][lib]['scalefactors'][
+        'spot_diameter_fullres']
     lowres_h, lowres_w = lowres_img.shape[:2]
+    return {
+        'lowres_scalef': lowres_scalef,
+        'spot_diameter_fullres': spot_diameter_fullres,
+        'lowres_w': lowres_w,
+        'lowres_h': lowres_h,
+    }
 
-    # 3. fullres -> content-region pixels in embedded image
-    scalef_x = lowres_scalef * (content_w / lowres_w)
-    scalef_y = lowres_scalef * (content_h / lowres_h)
 
-    # 4. Spot coords: fullres -> content-pixels -> embedded-pixels -> SVG space
+def _spots_to_svg(cx0, cy0, matrix_transform, scalef_x, scalef_y, visium_file) -> \
+    ndarray[tuple[Any, ...], dtype[Any]]:
     spots_full = numpy.asarray(visium_file.obsm['spatial'])
     spots_in_content = spots_full * numpy.array([scalef_x, scalef_y])
     spots_in_embedded = spots_in_content + numpy.array([cx0, cy0])
-
     M = numpy.array([[matrix_transform.a, matrix_transform.c, matrix_transform.e],
-                  [matrix_transform.b, matrix_transform.d, matrix_transform.f]])
+                     [matrix_transform.b, matrix_transform.d, matrix_transform.f]])
     ones = numpy.ones((spots_in_embedded.shape[0], 1))
     spots_svg = numpy.hstack([spots_in_embedded, ones]) @ M.T
+    return spots_svg
 
-    # 5. Build spatial index + assign
+
+def _assign_labels(annotations, priority, spot_radius, spots_svg):
     labels = [lbl for lbl, _ in annotations]
-    polys  = [poly for _, poly in annotations]
+    polys = [poly for _, poly in annotations]
     tree = shapely.strtree.STRtree(polys)
+    rank = {lbl: i for i, lbl in enumerate(priority)}
+    max_priority = len(priority)
+    
+    result = numpy.full(len(spots_svg), "", dtype=object)
+    for i, (sx, sy) in enumerate(spots_svg):
+        disc = shapely.geometry.Point(sx, sy).buffer(spot_radius)
+        best_rank = max_priority + 1
+        for j in tree.query(disc):
+            j = int(j)
+            if polys[j].intersects(disc):
+                r = rank.get(labels[j], max_priority)
+                if r < best_rank:
+                    best_rank = r
+                    result[i] = labels[j]
+    return result
 
+
+def assign_annotations(visium_file, annotations, matrix_transform,
+                       svg_file, priority=None, default="none"):
     if priority is None:
         priority = ["DCIS", "necrosis", "blood_vessel", "immune", "tumor"]
-    priority_rank = {lbl: i for i, lbl in enumerate(priority)}
 
-    result = numpy.full(spots_svg.shape[0], "", dtype=object)  # default to empty string
-    for i, (sx, sy) in enumerate(spots_svg):
-        pt = shapely.geometry.Point(sx, sy)
-        for j in tree.query(pt):
-            if polys[j].contains(pt):
-                current = result[i]
-                if current == "" or priority_rank.get(labels[j],
-                                                      1e9) < priority_rank.get(current,
-                                                                               1e9):
-                    result[i] = labels[j]
+    # 1. Extract embedded PNG to find tissue content bounds
+    content_h, content_w, cx0, cy0 = _content_bounds(svg_file)
+
+    # 2. Lowres image dimensions and scale factor
+    sp_metadata = _get_spatial_metadata(visium_file)
+
+    # 3. fullres -> content-region pixels in embedded image
+    scalef_x = sp_metadata["lowres_scalef"] * (content_w / sp_metadata["lowres_w"])
+    scalef_y = sp_metadata["lowres_scalef"] * (content_h / sp_metadata["lowres_h"])
+    fullres_to_svg_x = scalef_x * abs(matrix_transform.a)
+    fullres_to_svg_y = scalef_y * abs(matrix_transform.d)
+    fullres_to_svg = (fullres_to_svg_x + fullres_to_svg_y) / 2
+    spot_radius = (sp_metadata["spot_diameter_fullres"] / 2) * fullres_to_svg
+
+    # 4. Spot coords: fullres -> content-pixels -> embedded-pixels -> SVG space
+    spots_svg = _spots_to_svg(cx0, cy0, matrix_transform, scalef_x, scalef_y,
+                              visium_file)
+
+    # 5. Build spatial index + assign
+    result = _assign_labels(annotations, priority, spot_radius, spots_svg)
 
     visium_file.obs['annotation'] = pandas.Categorical(result)
     return visium_file
 
-def process_sample(sample_id: str, spaceranger_outs: Path, svg_path: Path) -> pandas.DataFrame:
+
+def process_sample(sample_id: str, spaceranger_outs: Path,
+                   svg_path: Path) -> pandas.DataFrame:
     adata = load_visium_raw(spaceranger_outs)
     annotations, matrix_transform, element_height, element_width = parse_svg(svg_path)
     adata = assign_annotations(adata, annotations, matrix_transform, svg_path)
     print(f"Processing sample {sample_id} {spaceranger_outs} {svg_path}")
     return adata
+
 
 def write_out_csv(sample_id: str, adata, index_name="Barcode",
                   annotation_column="Morphological Annotation"):
@@ -205,6 +257,7 @@ def write_out_csv(sample_id: str, adata, index_name="Barcode",
     out = out.rename(columns={"annotation": annotation_column})
     out.to_csv(OUT_DIR / f"{sample_id}.csv", index=True, na_rep="")
 
+
 def plot_result(sample_id: str, adata):
     ann = adata.obs["annotation"].astype(str)
     ann = ann.where(ann.isin(CATEGORIES), other=numpy.nan)
@@ -212,17 +265,17 @@ def plot_result(sample_id: str, adata):
     adata.uns["annotation_colors"] = [PALETTE[c] for c in CATEGORIES]
     adata = adata[adata.obs["annotation"].notna()].copy()
 
-    scanpy.pl.spatial(
+    squidpy.pl.spatial_scatter(
         adata,
         color="annotation",
-        spot_size=100,
-        alpha=0.9,
+        size=1,
+        alpha=0.95,
         legend_loc="right margin",
-        na_in_legend=False,
-        show=False,
+        legend_na=False,
+        save=OUT_DIR / f"{sample_id}.png",
+        dpi=100,
     )
-    plt.savefig(OUT_DIR / f"{sample_id}.png", dpi=100, bbox_inches="tight")
-    plt.close()
+
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -246,6 +299,7 @@ def main() -> int:
         return 1
     print(f"\nProcessed {len(SAMPLES)} samples to directory {OUT_DIR}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
