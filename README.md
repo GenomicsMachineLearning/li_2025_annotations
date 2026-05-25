@@ -41,3 +41,10 @@ uv pip install -e .
 download   # fetches spaceranger outputs and SVG annotations
 process    # parses SVGs, assigns annotations, writes CSVs + plots
 ```
+
+## Paper
+
+> Li, T., Yang, Q., Acs, B. et al. Computational pathology annotation enhances
+> the resolution and interpretation of breast cancer spatial transcriptomics
+> data. *npj Precis. Oncol.* **9**, 310 (2025).
+> https://doi.org/10.1038/s41698-025-01104-3
